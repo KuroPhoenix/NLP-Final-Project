@@ -1,4 +1,5 @@
 from __future__ import annotations
+import time
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -11,9 +12,14 @@ from . import data, features, cv, models_classical as mc, ensemble_routing as er
 from .metric import MODEL_NAMES, route_reward, cost_denominator
 
 
+def _log(msg):
+    print(f"[router] {msg}", flush=True)
+
+
 def _cache_np(path, fn, use_cache=True):
     path = Path(path)
     if use_cache and path.exists():
+        _log(f"cache hit: {path.name}")
         return np.load(path)
     arr = fn()
     if use_cache:
@@ -24,27 +30,35 @@ def _cache_np(path, fn, use_cache=True):
 def build_feature_blocks(cfg, train, test, extra_tr=None, extra_te=None):
     """Return dense X (for LGBM) and sparse X (for linear), train+test.
     extra_* (e.g. LLM difficulty features) are appended to the dense block only."""
+    t = time.time()
     hc_tr = features.handcrafted_matrix(train["query"])
     hc_te = features.handcrafted_matrix(test["query"])
     sc = StandardScaler().fit(hc_tr)
     hc_tr_s = sc.transform(hc_tr).astype(np.float32)
     hc_te_s = sc.transform(hc_te).astype(np.float32)
+    _log(f"handcrafted: {hc_tr_s.shape[1]} dims ({time.time() - t:.0f}s)")
 
+    t = time.time()
     tfidf = features.build_tfidf(cfg)
-    tr_txt = [features.cap_text(t, cfg.tfidf_max_chars) for t in train["query"]]
-    te_txt = [features.cap_text(t, cfg.tfidf_max_chars) for t in test["query"]]
+    tr_txt = [features.cap_text(s, cfg.tfidf_max_chars) for s in train["query"]]
+    te_txt = [features.cap_text(s, cfg.tfidf_max_chars) for s in test["query"]]
     Xtf_tr = tfidf.fit_transform(tr_txt)
     Xtf_te = tfidf.transform(te_txt)
+    _log(f"TF-IDF: {Xtf_tr.shape[1]} features ({time.time() - t:.0f}s)")
+
+    t = time.time()
     n_comp = max(2, min(cfg.svd_components, Xtf_tr.shape[1] - 1))
     svd = TruncatedSVD(n_components=n_comp, random_state=cfg.seed).fit(Xtf_tr)
     svd_tr = svd.transform(Xtf_tr).astype(np.float32)
     svd_te = svd.transform(Xtf_te).astype(np.float32)
+    _log(f"SVD -> {n_comp} dims ({time.time() - t:.0f}s)")
 
     try:
         emb_tr = features.load_or_compute_embeddings(cfg, train, "train")
         emb_te = features.load_or_compute_embeddings(cfg, test, "test")
+        _log(f"embeddings: {emb_tr.shape[1]} dims")
     except Exception as e:
-        print("embeddings unavailable, proceeding without:", repr(e))
+        print("embeddings unavailable, proceeding without:", repr(e), flush=True)
         emb_tr = np.zeros((len(train), 0), np.float32)
         emb_te = np.zeros((len(test), 0), np.float32)
 
@@ -57,14 +71,17 @@ def build_feature_blocks(cfg, train, test, extra_tr=None, extra_te=None):
     dense_te = np.hstack(blocks_te).astype(np.float32)
     sparse_tr = hstack([Xtf_tr, csr_matrix(hc_tr_s)]).tocsr()
     sparse_te = hstack([Xtf_te, csr_matrix(hc_te_s)]).tocsr()
+    _log(f"feature blocks ready: dense={dense_tr.shape}, sparse={sparse_tr.shape}")
     return dense_tr, dense_te, sparse_tr, sparse_te
 
 
 def route_and_submit(cfg, oof_list, test_list, perf, cost, cost_const, denom,
                      test, sample, names):
+    _log("tuning ensemble weights...")
     w, w_reward = er.tune_weights(oof_list, perf, cost, cost_const, denom, step=0.1)
     oof_blend = er.weighted_average(oof_list, w)
     test_blend = er.weighted_average(test_list, w)
+    _log(f"weights={list(np.round(w, 2))} (oof {w_reward:.5f}); tuning per-model bias...")
     bias = er.tune_bias(oof_blend, perf, cost, cost_const, denom)
     oof_reward = route_reward(er.route(oof_blend, cost_const, denom, bias), perf, cost, denom)
 
@@ -96,7 +113,9 @@ def _add_calibrated(oof_list, test_list, names, oof, test, perf, name):
 
 def run_phase0(cfg: CFG):
     seed_everything(cfg.seed)
+    _log("loading data...")
     train, test, sample = data.load_data(cfg)
+    _log(f"train={train.shape} test={test.shape}")
     perf, cost = data.build_targets(train)
     cost_const = data.cost_constants(cost)
     denom = cost_denominator(cost)
@@ -106,25 +125,31 @@ def run_phase0(cfg: CFG):
     tag = len(train)
 
     oof_list, test_list, names = [], [], []
+    _log("training linear (Ridge) base learner...")
+    t = time.time()
     lin_oof = _cache_np(cfg.cache_dir / f"lin_oof_{tag}.npy",
-                        lambda: mc.linear_oof(sparse_tr, perf, folds, cfg.seed), uc)
+                        lambda: mc.linear_oof(sparse_tr, perf, folds, cfg.seed, verbose=True), uc)
     lin_test = _cache_np(cfg.cache_dir / f"lin_test_{tag}.npy",
-                         lambda: mc.linear_full(sparse_tr, perf, sparse_te, cfg.seed), uc)
+                         lambda: mc.linear_full(sparse_tr, perf, sparse_te, cfg.seed, verbose=True), uc)
+    _log(f"linear done ({time.time() - t:.0f}s)")
     _add_calibrated(oof_list, test_list, names, lin_oof, lin_test, perf, "linear")
 
     try:
         import lightgbm  # noqa: F401
         have_lgbm = True
     except Exception as e:
-        print("LightGBM unavailable -> linear-only Phase 0:", repr(e))
+        print("LightGBM unavailable -> linear-only Phase 0:", repr(e), flush=True)
         have_lgbm = False
     if have_lgbm:
+        _log("training LightGBM base learner (the slow part: 66 fits)...")
+        t = time.time()
         g_oof = _cache_np(cfg.cache_dir / f"lgbm_oof_{tag}.npy",
             lambda: mc.lgbm_oof(dense_tr, perf, folds, cfg.lgbm_estimators, cfg.lgbm_lr,
-                                cfg.lgbm_leaves, cfg.lgbm_min_child, cfg.seed), uc)
+                                cfg.lgbm_leaves, cfg.lgbm_min_child, cfg.seed, verbose=True), uc)
         g_test = _cache_np(cfg.cache_dir / f"lgbm_test_{tag}.npy",
             lambda: mc.lgbm_full(dense_tr, perf, dense_te, cfg.lgbm_estimators, cfg.lgbm_lr,
-                                 cfg.lgbm_leaves, cfg.lgbm_min_child, cfg.seed), uc)
+                                 cfg.lgbm_leaves, cfg.lgbm_min_child, cfg.seed, verbose=True), uc)
+        _log(f"lgbm done ({time.time() - t:.0f}s)")
         _add_calibrated(oof_list, test_list, names, g_oof, g_test, perf, "lgbm")
 
     return route_and_submit(cfg, oof_list, test_list, perf, cost, cost_const, denom,
