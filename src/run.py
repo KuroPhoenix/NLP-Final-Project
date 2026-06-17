@@ -156,5 +156,49 @@ def run_phase0(cfg: CFG):
                             test, sample, names)
 
 
+def run_phase1(cfg: CFG):
+    """Phase 1: add the fine-tuned ModernBERT encoder, ensembled with cached Phase-0 learners."""
+    from . import models_encoder as me
+    seed_everything(cfg.seed)
+    _log("loading data...")
+    train, test, sample = data.load_data(cfg)
+    perf, cost = data.build_targets(train)
+    cost_const = data.cost_constants(cost)
+    denom = cost_denominator(cost)
+    folds = cv.get_folds(cfg, perf, train["query"])
+    tag = len(train)
+    uc = not cfg.smoke
+
+    oof_list, test_list, names = [], [], []
+    for nm, a, b in [("linear", f"lin_oof_{tag}.npy", f"lin_test_{tag}.npy"),
+                     ("lgbm", f"lgbm_oof_{tag}.npy", f"lgbm_test_{tag}.npy")]:
+        pa, pb = cfg.cache_dir / a, cfg.cache_dir / b
+        if pa.exists() and pb.exists():
+            _add_calibrated(oof_list, test_list, names, np.load(pa), np.load(pb), perf, nm)
+            _log(f"loaded cached {nm}")
+        else:
+            _log(f"WARNING: {nm} cache missing ({a}); run Phase 0 first for the full ensemble")
+
+    etag = me.cache_tag(cfg, len(train))
+    enc_oof_p = cfg.cache_dir / f"enc_oof_{etag}.npy"
+    enc_test_p = cfg.cache_dir / f"enc_test_{etag}.npy"
+    if uc and enc_oof_p.exists() and enc_test_p.exists():
+        _log("loaded cached encoder predictions")
+        enc_oof, enc_test = np.load(enc_oof_p), np.load(enc_test_p)
+    else:
+        _log("training ModernBERT encoder (5 folds + full-fit)...")
+        t = time.time()
+        enc_oof, enc_test = me.encoder_oof_and_test(cfg, train, test, perf, folds)
+        if uc:
+            np.save(enc_oof_p, enc_oof); np.save(enc_test_p, enc_test)
+        _log(f"encoder done ({time.time() - t:.0f}s)")
+    _add_calibrated(oof_list, test_list, names, enc_oof, enc_test, perf, "encoder")
+    enc_solo = route_reward(er.route(oof_list[-1], cost_const, denom), perf, cost, denom)
+    _log(f"encoder-alone OOF route reward: {enc_solo:.5f}")
+
+    return route_and_submit(cfg, oof_list, test_list, perf, cost, cost_const, denom,
+                            test, sample, names)
+
+
 if __name__ == "__main__":
     run_phase0(CFG())
