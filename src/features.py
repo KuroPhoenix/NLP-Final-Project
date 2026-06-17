@@ -58,16 +58,20 @@ def _embed_cache_path(cfg, split: str, n: int) -> Path:
 
 
 def load_or_compute_embeddings(cfg, df: pd.DataFrame, split: str) -> np.ndarray:
-    """Reuse cached Qwen3 embeddings if present (new or previous run dir); else compute (GPU)."""
+    """Reuse cached Qwen3 embeddings if present (search any Output/*/cache); else compute (GPU)."""
     n = len(df)
     target = _embed_cache_path(cfg, split, n)
     if target.exists():
         return np.load(target)
-    prev = cfg.prev_cache_dir / f"{cfg.embedding_cache_name}_{split}_{n}.npy"
-    if prev.exists():
-        emb = np.load(prev)
-        np.save(target, emb)
-        return emb
+    fname = f"{cfg.embedding_cache_name}_{split}_{n}.npy"
+    candidates = [cfg.prev_cache_dir / fname,
+                  cfg.root / "Output" / "router_a100_exact_metric_v2" / "cache" / fname]
+    candidates += sorted((cfg.root / "Output").rglob(fname))
+    for c in candidates:
+        if c.exists():
+            emb = np.load(c)
+            np.save(target, emb)
+            return emb
     return _compute_embeddings(cfg, df, split, target)
 
 
