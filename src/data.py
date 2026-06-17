@@ -26,6 +26,7 @@ def load_data(cfg):
         train = train.sample(min(cfg.smoke_rows, len(train)),
                              random_state=cfg.seed).sort_values("ID").reset_index(drop=True)
         test = test.head(min(200, len(test))).copy()
+        sample = sample.head(len(test)).copy()  # keep submission aligned with truncated test
     return train, test, sample
 
 

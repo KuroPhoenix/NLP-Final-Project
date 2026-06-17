@@ -1,48 +1,41 @@
 from __future__ import annotations
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import Ridge
+
+# NOTE: `performance` is ordinal in {0.0, 0.5, 1.0}, and the metric rewards
+# mean(performance). We therefore predict EXPECTED performance via regression
+# (clipped to [0, 1]) rather than classifying a binary label.
+
+
+def _clip01(a):
+    return np.clip(a, 0.0, 1.0).astype(np.float32)
 
 
 def _lgbm_factory(n_estimators, lr, leaves, min_child, seed=42):
-    from lightgbm import LGBMClassifier
-    return lambda: LGBMClassifier(
-        objective="binary", n_estimators=n_estimators, learning_rate=lr,
+    from lightgbm import LGBMRegressor
+    return lambda: LGBMRegressor(
+        objective="regression", n_estimators=n_estimators, learning_rate=lr,
         num_leaves=leaves, min_child_samples=min_child, subsample=0.9,
         colsample_bytree=0.85, reg_alpha=0.05, reg_lambda=0.2,
         random_state=seed, n_jobs=-1, verbosity=-1)
-
-
-def _const_or_proba(model, X):
-    # robust when a fold's label column is single-class
-    if hasattr(model, "classes_") and len(model.classes_) == 1:
-        return np.full(X.shape[0], float(model.classes_[0]), dtype=np.float32)
-    return model.predict_proba(X)[:, 1].astype(np.float32)
 
 
 def _oof_multilabel(factory, X, Y, folds):
     oof = np.zeros_like(Y, dtype=np.float32)
     for tr, va in folds:
         for j in range(Y.shape[1]):
-            ytr = Y[tr, j]
-            if len(np.unique(ytr)) == 1:
-                oof[va, j] = float(ytr[0])
-                continue
             m = factory()
-            m.fit(X[tr], ytr)
-            oof[va, j] = _const_or_proba(m, X[va])
+            m.fit(X[tr], Y[tr, j])
+            oof[va, j] = _clip01(m.predict(X[va]))
     return oof
 
 
 def _full_multilabel(factory, X, Y, X_test):
     test = np.zeros((X_test.shape[0], Y.shape[1]), dtype=np.float32)
     for j in range(Y.shape[1]):
-        y = Y[:, j]
-        if len(np.unique(y)) == 1:
-            test[:, j] = float(y[0])
-            continue
         m = factory()
-        m.fit(X, y)
-        test[:, j] = _const_or_proba(m, X_test)
+        m.fit(X, Y[:, j])
+        test[:, j] = _clip01(m.predict(X_test))
     return test
 
 
@@ -54,13 +47,13 @@ def lgbm_full(X, Y, X_test, n_estimators=1200, lr=0.03, leaves=31, min_child=30,
     return _full_multilabel(_lgbm_factory(n_estimators, lr, leaves, min_child, seed), X, Y, X_test)
 
 
-def _linear_factory(seed=42):
-    return lambda: LogisticRegression(C=1.0, max_iter=2000, solver="liblinear", random_state=seed)
+def _ridge_factory(alpha=8.0, seed=42):
+    return lambda: Ridge(alpha=alpha, random_state=seed)
 
 
-def linear_oof(X, Y, folds, seed=42):
-    return _oof_multilabel(_linear_factory(seed), X, Y, folds)
+def linear_oof(X, Y, folds, seed=42, alpha=8.0):
+    return _oof_multilabel(_ridge_factory(alpha, seed), X, Y, folds)
 
 
-def linear_full(X, Y, X_test, seed=42):
-    return _full_multilabel(_linear_factory(seed), X, Y, X_test)
+def linear_full(X, Y, X_test, seed=42, alpha=8.0):
+    return _full_multilabel(_ridge_factory(alpha, seed), X, Y, X_test)
