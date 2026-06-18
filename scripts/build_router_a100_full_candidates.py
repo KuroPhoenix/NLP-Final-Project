@@ -68,8 +68,13 @@ def main() -> None:
     assert saved_baseline["pred_model"].tolist() == MODEL_NAMES[baseline_idx].tolist()
 
     records = []
-    for quantile in (0.05, 0.075, 0.10):
-        quantile_label = "075" if quantile == 0.075 else f"{int(quantile * 100):02d}"
+    for quantile in (0.04, 0.045, 0.05, 0.055, 0.075, 0.10):
+        percent = quantile * 100
+        quantile_label = (
+            f"{int(round(percent)):02d}"
+            if float(percent).is_integer()
+            else f"{int(round(percent * 10)):03d}"
+        )
         threshold = float(np.quantile(oof_margin, quantile))
         oof_idx = apply_margin_fallback(oof, threshold)
         test_idx = apply_margin_fallback(test_scores, threshold)
