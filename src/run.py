@@ -75,14 +75,9 @@ def build_feature_blocks(cfg, train, test, extra_tr=None, extra_te=None):
     return dense_tr, dense_te, sparse_tr, sparse_te
 
 
-def _add_calibrated(oof_list, test_list, names, oof, test, perf, name):
-    co, ct = er.isotonic_calibrate(oof, perf, test)
-    oof_list.append(co); test_list.append(ct); names.append(name)
-
-
 def classical_learners(cfg, train, test, perf, folds, extra_tr=None, extra_te=None):
-    """Linear (Ridge) + LightGBM base learners, calibrated. Reuses cache when present,
-    else computes (so any phase can call this and get the full classical ensemble)."""
+    """RAW (uncalibrated) linear (Ridge) + LightGBM base learners. Calibration is done
+    later (honestly) in route_and_submit. Reuses cache when present, else computes."""
     uc = not cfg.smoke
     tag = len(train)
     paths = [cfg.cache_dir / f"{p}_{tag}.npy" for p in ("lin_oof", "lin_test", "lgbm_oof", "lgbm_test")]
@@ -100,7 +95,7 @@ def classical_learners(cfg, train, test, perf, folds, extra_tr=None, extra_te=No
     lin_test = _cache_np(cfg.cache_dir / f"lin_test_{tag}.npy",
                          lambda: mc.linear_full(sparse_tr, perf, sparse_te, cfg.seed, verbose=True), uc)
     _log(f"linear ready ({time.time() - t:.0f}s)")
-    _add_calibrated(oof_list, test_list, names, lin_oof, lin_test, perf, "linear")
+    oof_list.append(lin_oof); test_list.append(lin_test); names.append("linear")
 
     try:
         import lightgbm  # noqa: F401
@@ -118,39 +113,61 @@ def classical_learners(cfg, train, test, perf, folds, extra_tr=None, extra_te=No
             lambda: mc.lgbm_full(dense_tr, perf, dense_te, cfg.lgbm_estimators, cfg.lgbm_lr,
                                  cfg.lgbm_leaves, cfg.lgbm_min_child, cfg.seed, verbose=True), uc)
         _log(f"lgbm ready ({time.time() - t:.0f}s)")
-        _add_calibrated(oof_list, test_list, names, g_oof, g_test, perf, "lgbm")
+        oof_list.append(g_oof); test_list.append(g_test); names.append("lgbm")
     return oof_list, test_list, names
 
 
-def route_and_submit(cfg, oof_list, test_list, perf, cost, cost_const, denom,
+def route_and_submit(cfg, oof_list, test_list, perf, cost, cost_const, denom, folds,
                      test, sample, names):
-    _log("tuning ensemble weights...")
-    w, w_reward = er.tune_weights(oof_list, perf, cost, cost_const, denom, step=0.1)
-    oof_blend = er.weighted_average(oof_list, w)
-    test_blend = er.weighted_average(test_list, w)
-    _log(f"weights={list(np.round(w, 2))} (oof {w_reward:.5f}); tuning per-model bias...")
-    bias = er.tune_bias(oof_blend, perf, cost, cost_const, denom)
-    oof_reward = route_reward(er.route(oof_blend, cost_const, denom, bias), perf, cost, denom)
+    """Honest calibration + conservative, K-anchored policy selection with an always-K floor.
+    The reported reward is an honest (nested-calibration) estimate meant to track the LB."""
+    k_idx = MODEL_NAMES.index("Model_K")
 
-    rows = []
-    for nm, oof in zip(names, oof_list):
-        rows.append({"method": nm,
-                     "oof_reward": route_reward(er.route(oof, cost_const, denom), perf, cost, denom)})
-    rows.append({"method": f"ensemble({'+'.join(names)})_w={list(np.round(w, 2))}", "oof_reward": w_reward})
-    rows.append({"method": "ensemble+bias", "oof_reward": oof_reward})
-    k = MODEL_NAMES.index("Model_K")
-    rows.append({"method": "always_K", "oof_reward": route_reward(np.full(len(perf), k), perf, cost, denom)})
+    # Per-model calibration: NESTED for honest evaluation; full-OOF fit applied to test.
+    cal_oof_list, cal_test_list = [], []
+    for oof, te in zip(oof_list, test_list):
+        cal_oof_list.append(er.nested_calibrate(oof, perf, folds))
+        _, full_cal_test = er.isotonic_calibrate(oof, perf, te)
+        cal_test_list.append(full_cal_test)
+
+    # Coarse, low-overfit weight selection on the honestly-calibrated OOF.
+    if len(cal_oof_list) == 1:
+        w = np.array([1.0])
+    else:
+        w, _ = er.tune_weights(cal_oof_list, perf, cost, cost_const, denom, step=0.5)
+    blend_oof = er.weighted_average(cal_oof_list, w)
+    blend_test = er.weighted_average(cal_test_list, w)
+
+    # Conservative policy selection (always-K is a candidate -> never below baseline).
+    sel = er.select_policy(blend_oof, perf, cost, cost_const, denom, k_idx)
+    policy, margin = sel["best_policy"], sel["best_margin"]
+    _log(f"weights={list(np.round(w, 2))} | honest: always_K={sel['always_K']:.5f} "
+         f"argmax={sel['argmax']:.5f} k_margin={sel['k_margin']:.5f}(m={margin:.3f}) -> {policy}")
+
+    rows = [{"method": "always_K", "oof_reward": sel["always_K"]}]
+    for nm, co in zip(names, cal_oof_list):
+        rows.append({"method": f"{nm}_solo",
+                     "oof_reward": route_reward(er.route(co, cost_const, denom), perf, cost, denom)})
+    rows.append({"method": f"blend_argmax_w={list(np.round(w, 2))}", "oof_reward": sel["argmax"]})
+    rows.append({"method": f"blend_k_margin(m={margin:.3f})", "oof_reward": sel["k_margin"]})
     comp = pd.DataFrame(rows).sort_values("oof_reward", ascending=False)
     comp.to_csv(cfg.out_dir / "model_comparison.csv", index=False)
     print(comp.to_string(index=False))
 
-    test_idx = er.route(test_blend, cost_const, denom, bias)
+    if policy == "always_K":
+        test_idx = np.full(len(test), k_idx, dtype=np.int64)
+    elif policy == "k_margin":
+        test_idx = er.route_k_anchored(blend_test, cost_const, denom, k_idx, margin)
+    else:
+        test_idx = er.route(blend_test, cost_const, denom)
     er.write_submission(cfg.out_dir / "submission.csv", test["ID"].to_numpy(), test_idx, sample)
+
+    honest = max(sel["always_K"], sel["argmax"], sel["k_margin"])
     dist = pd.Series([MODEL_NAMES[i] for i in test_idx]).value_counts()
-    print("\nOOF ensemble+bias reward:", round(oof_reward, 5))
+    print(f"\nHONEST CV reward (policy '{policy}'): {honest:.5f}  [always_K {sel['always_K']:.5f}]")
     print("submission model distribution:\n", dist.to_string())
-    return {"oof_reward": oof_reward, "weights": w.tolist(), "bias": bias.tolist(),
-            "oof_blend": oof_blend, "test_blend": test_blend}
+    return {"honest_reward": honest, "policy": policy, "margin": margin, "weights": w.tolist(),
+            "blend_oof": blend_oof, "blend_test": blend_test, "k_idx": k_idx}
 
 
 def _prep(cfg):
@@ -169,7 +186,7 @@ def run_phase0(cfg: CFG):
     train, test, sample, perf, cost, cost_const, denom, folds = _prep(cfg)
     oof_list, test_list, names = classical_learners(cfg, train, test, perf, folds)
     return route_and_submit(cfg, oof_list, test_list, perf, cost, cost_const, denom,
-                            test, sample, names)
+                            folds, test, sample, names)
 
 
 def run_phase1(cfg: CFG):
@@ -193,12 +210,10 @@ def run_phase1(cfg: CFG):
         if uc:
             np.save(enc_oof_p, enc_oof); np.save(enc_test_p, enc_test)
         _log(f"encoder done ({time.time() - t:.0f}s)")
-    _add_calibrated(oof_list, test_list, names, enc_oof, enc_test, perf, "encoder")
-    enc_solo = route_reward(er.route(oof_list[-1], cost_const, denom), perf, cost, denom)
-    _log(f"encoder-alone OOF route reward: {enc_solo:.5f}")
+    oof_list.append(enc_oof); test_list.append(enc_test); names.append("encoder")
 
     return route_and_submit(cfg, oof_list, test_list, perf, cost, cost_const, denom,
-                            test, sample, names)
+                            folds, test, sample, names)
 
 
 if __name__ == "__main__":

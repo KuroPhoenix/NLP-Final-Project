@@ -90,6 +90,46 @@ def tune_bias(p_hat, perf, cost, cost_const, denom, grid=None, passes=3):
     return bias
 
 
+def route_k_anchored(p_hat, cost_const, denom, k_idx, margin):
+    """Argmax expected reward, but only leave Model_K when the best alternative beats K's
+    expected reward by `margin`. A conservative, K-anchored policy (1 parameter)."""
+    er = expected_reward_matrix(p_hat, cost_const, denom)
+    idx = er.argmax(1)
+    best = er[np.arange(len(er)), idx]
+    keep = (best - er[:, k_idx]) > margin
+    return np.where(keep, idx, k_idx).astype(np.int64)
+
+
+def nested_calibrate(oof, perf, folds):
+    """Honest per-model isotonic calibration: each fold's rows are calibrated by isotonic
+    fit on the OTHER folds, removing the in-sample optimism of fitting+scoring on the same OOF."""
+    oof = np.asarray(oof, np.float64)
+    out = np.zeros_like(oof)
+    n = len(oof)
+    for _, va in folds:
+        tr = np.setdiff1d(np.arange(n), va)
+        _, cal_va = isotonic_calibrate(oof[tr], perf[tr], oof[va])
+        out[va] = cal_va
+    return out
+
+
+def select_policy(p_hat, perf, cost, cost_const, denom, k_idx, margins=None):
+    """Score candidate routing policies (always-K, plain argmax, K-anchored margin) and
+    return their rewards plus the best pick. always-K is always a candidate, so the chosen
+    policy can never score below the trivial baseline on the evaluation data."""
+    if margins is None:
+        margins = np.linspace(0.0, 0.25, 26)
+    a_k = route_reward(np.full(len(perf), k_idx), perf, cost, denom)
+    arg = route_reward(route(p_hat, cost_const, denom), perf, cost, denom)
+    best_m, best_km = 0.0, -1e9
+    for m in margins:
+        r = route_reward(route_k_anchored(p_hat, cost_const, denom, k_idx, m), perf, cost, denom)
+        if r > best_km:
+            best_km, best_m = r, float(m)
+    cands = {"always_K": a_k, "argmax": arg, "k_margin": best_km}
+    return {**cands, "best_margin": best_m, "best_policy": max(cands, key=cands.get)}
+
+
 def write_submission(path, test_ids, pred_idx, sample_df) -> Path:
     path = Path(path)
     pred_model = [MODEL_NAMES[int(i)] for i in pred_idx]
