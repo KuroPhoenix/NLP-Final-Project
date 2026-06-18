@@ -68,12 +68,13 @@ def main() -> None:
     assert saved_baseline["pred_model"].tolist() == MODEL_NAMES[baseline_idx].tolist()
 
     records = []
-    for quantile in (0.05, 0.10):
+    for quantile in (0.05, 0.075, 0.10):
+        quantile_label = "075" if quantile == 0.075 else f"{int(quantile * 100):02d}"
         threshold = float(np.quantile(oof_margin, quantile))
         oof_idx = apply_margin_fallback(oof, threshold)
         test_idx = apply_margin_fallback(test_scores, threshold)
         path = write_submission(
-            f"submission_candidate_k_fallback_q{int(quantile * 100):02d}.csv",
+            f"submission_candidate_k_fallback_q{quantile_label}.csv",
             test["ID"].to_numpy(),
             test_idx,
         )
@@ -88,6 +89,56 @@ def main() -> None:
                 pd.Series(MODEL_NAMES[test_idx]).value_counts().to_dict()
             ),
         })
+
+    # Contingency: preserve the proven 5% fallback, then extend only to uncertain
+    # Model_H routes in the 5%-10% margin band. Model_H is the dominant expensive
+    # choice in that band, so this isolates whether broader fallback gains come
+    # specifically from suppressing uncertain H routes.
+    q05_threshold = float(np.quantile(oof_margin, 0.05))
+    q10_threshold = float(np.quantile(oof_margin, 0.10))
+    oof_base_idx = oof.argmax(axis=1)
+    test_base_idx = test_scores.argmax(axis=1)
+    model_h_idx = int(np.where(MODEL_NAMES == "Model_H")[0][0])
+    oof_select = (
+        (oof_margin <= q05_threshold)
+        | (
+            (oof_margin > q05_threshold)
+            & (oof_margin <= q10_threshold)
+            & (oof_base_idx == model_h_idx)
+        )
+    )
+    test_top2 = np.sort(np.partition(test_scores, -2, axis=1)[:, -2:], axis=1)
+    test_margin = test_top2[:, 1] - test_top2[:, 0]
+    test_select = (
+        (test_margin <= q05_threshold)
+        | (
+            (test_margin > q05_threshold)
+            & (test_margin <= q10_threshold)
+            & (test_base_idx == model_h_idx)
+        )
+    )
+    oof_h_idx = oof_base_idx.copy()
+    test_h_idx = test_base_idx.copy()
+    oof_h_idx[oof_select] = MODEL_K_IDX
+    test_h_idx[test_select] = MODEL_K_IDX
+    selective_path = write_submission(
+        "submission_candidate_q05_plus_q05to10_model_h.csv",
+        test["ID"].to_numpy(),
+        test_h_idx,
+    )
+    records.append({
+        "candidate": selective_path.name,
+        "oof_margin_quantile": "0.05 + H-only through 0.10",
+        "threshold": q10_threshold,
+        "oof_reward": reward(oof_h_idx),
+        "test_changes_vs_validated_046853": int(
+            (test_h_idx != baseline_idx).sum()
+        ),
+        "test_model_K_count": int((test_h_idx == MODEL_K_IDX).sum()),
+        "test_distribution": json.dumps(
+            pd.Series(MODEL_NAMES[test_h_idx]).value_counts().to_dict()
+        ),
+    })
 
     all_k = np.full(len(test), MODEL_K_IDX, dtype=np.int64)
     all_k_path = write_submission(
