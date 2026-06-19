@@ -165,6 +165,58 @@ def main() -> None:
     report.to_csv(OUT / "candidate_probe_report.csv", index=False)
     print(report.to_string(index=False))
 
+    # Weight refinement selected identically by all five leave-one-fold searches.
+    # Components: TF-IDF Ridge, embedding Ridge, embedding LGBM, two-head LGBM.
+    refined_stems = (
+        "tfidf_ridge",
+        "qwen3_embedding_ridge",
+        "qwen3_embedding_lgbm",
+        "qwen3_embedding_lgbm_two_head",
+    )
+    refined_weights = np.array([0.65, 0.25, 0.05, 0.05], dtype=np.float64)
+    refined_oof = sum(
+        weight * load_scores(stem, "oof").astype(np.float64)
+        for stem, weight in zip(refined_stems, refined_weights)
+    )
+    refined_test = sum(
+        weight * load_scores(stem, "test").astype(np.float64)
+        for stem, weight in zip(refined_stems, refined_weights)
+    )
+    refined_top2 = np.sort(
+        np.partition(refined_oof, -2, axis=1)[:, -2:], axis=1
+    )
+    refined_margin = refined_top2[:, 1] - refined_top2[:, 0]
+    refined_threshold = float(np.quantile(refined_margin, 0.05))
+    refined_oof_idx = apply_margin_fallback(refined_oof, refined_threshold)
+    refined_test_idx = apply_margin_fallback(refined_test, refined_threshold)
+    refined_path = write_submission(
+        "submission_candidate_weights_065_025_005_005_q05.csv",
+        test["ID"].to_numpy(),
+        refined_test_idx,
+    )
+    refined_report = pd.DataFrame([{
+        "candidate": refined_path.name,
+        "weights": json.dumps(dict(zip(refined_stems, refined_weights))),
+        "fallback_quantile": 0.05,
+        "threshold": refined_threshold,
+        "oof_reward": reward(refined_oof_idx),
+        "test_changes_vs_public_best_q05": int(
+            (
+                MODEL_NAMES[refined_test_idx]
+                != pd.read_csv(
+                    OUT / "submission_candidate_k_fallback_q05.csv"
+                )["pred_model"].to_numpy()
+            ).sum()
+        ),
+        "test_model_K_count": int((refined_test_idx == MODEL_K_IDX).sum()),
+        "test_distribution": json.dumps(
+            pd.Series(MODEL_NAMES[refined_test_idx]).value_counts().to_dict()
+        ),
+    }])
+    refined_report.to_csv(OUT / "weight_refinement_report.csv", index=False)
+    print("\nWeight refinement candidate")
+    print(refined_report.to_string(index=False))
+
 
 if __name__ == "__main__":
     main()
