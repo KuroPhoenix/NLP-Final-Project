@@ -1,8 +1,6 @@
 # INLP 2026 Final Project — LLM Routing
-### Report (Team_XX)  ·  *replace with your Team ID*
+### Report (Team 4) 
 
-> Drafting notes (delete before submission): placeholders are marked `‹…›`. Verify the exact
-> public-LB numbers against your Kaggle submission history before finalizing.
 
 ---
 
